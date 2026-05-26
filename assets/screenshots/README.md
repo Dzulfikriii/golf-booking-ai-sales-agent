@@ -1,20 +1,10 @@
 # Screenshots
 
-Drop your captured PNGs here using these filenames so the README references resolve:
+- `1.jpeg` — WhatsApp thread (golfer side): the AI lists supported clubs and deflects a prompt-injection attempt.
+- `2.jpeg` — WhatsApp thread (golfer side): the AI extracts club, date, and time from one natural-language sentence and asks for the missing field.
 
-| Filename | Suggested capture |
-|---|---|
-| `bookings-list.png` | The `/bookings` list page showing several bookings at different statuses. Bonus if at least one row is `payment_received` so the status colour variety shows. |
-| `conversation-view.png` | A booking detail page (`/bookings/[id]`) with the conversation panel visible — golfer messages on one side, AI replies on the other, payment-proof image embedded. |
+Worth adding when convenient:
 
-Optional extras you can add and reference in the main README:
-
-- `dashboard-detail.png` — full booking detail page with action buttons + activity log.
-- `whatsapp-thread.png` — a screenshot of the actual WhatsApp thread on your phone (golfer side) to show the user-visible experience.
-- `architecture-diagram.png` — if you want to replace the ASCII diagram with a rendered version (excalidraw, draw.io, Figma export).
-
-## Capture tips
-
-- Use **light mode** for screenshots — they read better in GitHub's README on both light and dark themes.
-- Resize to a max width of ~1600px before committing; PNGs above 1MB make the repo clone slow.
-- For the conversation view, populate with realistic-looking sample data, not Lorem Ipsum — recruiters look at this.
+- A `/bookings` list-page capture showing several bookings at different statuses.
+- A booking-detail page with the action buttons and the activity log visible.
+- A payment-proof viewer with a sample screenshot attached.

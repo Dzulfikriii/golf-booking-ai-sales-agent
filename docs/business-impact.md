@@ -1,105 +1,53 @@
 # Business impact
 
-The PRD's North Star was a single number: **reduce manual messaging workload by at least 70%.** This doc walks through how the system delivers that, what it doesn't try to automate, and how the gains compound as volume grows.
+A few notes on what the system changes about the operator's day, and why the math works the way it does.
 
-## What the human used to do per booking
+## What the operator used to spend time on
 
-Walking through a single end-to-end booking pre-system, agent's time looks like:
+Walk through a single booking pre-system and the agent's time is mostly in messaging work: reading the inbound, parsing out club / date / time / players, asking follow-up questions, waiting for replies, relaying availability back, sending bank details, eyeballing a payment screenshot, then writing a final confirmation. The actually skilled parts (phoning the club, verifying the payment lands) are short. The typing is long.
 
-| Step | Activity | Time |
-|---|---|---|
-| 1 | Read golfer's incoming WhatsApp, parse out club / date / time / players | ~3 min |
-| 2 | Reply asking for whichever fields were missing, wait for response, parse again | ~2 min |
-| 3 | Phone the golf club, ask about the slot | ~5 min |
-| 4 | Relay availability back to golfer over WhatsApp, ask for confirmation | ~3 min |
-| 5 | Send payment instructions (bank account, amount), wait for screenshot | ~2 min |
-| 6 | Receive screenshot, eyeball it, file it somewhere (Drive / phone gallery) | ~3 min |
-| 7 | Verify the payment lands | ~1 min |
-| 8 | Phone the club again to confirm the booking | ~4 min |
-| 9 | Send the golfer a final confirmation with all details | ~2 min |
-| **Total** | | **~25 min** |
+Each booking has on the order of twenty to thirty individual messages exchanged. Most of them are mechanical: clarifying details, sending the same bank account number, formatting the same confirmation. Doing this across five concurrent conversations means a lot of context-switching, and inevitably some messages slip through unanswered.
 
-That's a *focused* booking. In reality the agent is juggling 5 conversations at once, switching context, scrolling for old messages, and re-typing the same bank account number for the tenth time.
+## What changes
 
-## What the human does post-system
+The system absorbs the mechanical messaging. The operator's job becomes:
 
-The system automates exactly the parts that don't need human judgement. The operator's job becomes:
+- Take a phone call to the golf club.
+- Click one button on the dashboard ("Slot Available" or "Slot Unavailable").
+- Eyeball a payment screenshot when one arrives, click "Verify Payment".
+- Phone the club again to confirm.
+- Click "Mark Club Notified" and then "Mark Completed".
 
-| Step | Activity | Time |
-|---|---|---|
-| 1 | (AI handles intake — operator does nothing) | 0 min |
-| 2 | (AI handles clarification — operator does nothing) | 0 min |
-| 3 | Phone the golf club | ~5 min |
-| 4 | Click "Slot Available" / "Slot Unavailable" on dashboard | ~10 sec |
-| 5 | (AI sends availability + confirmation request) | 0 min |
-| 6 | (AI sends payment instructions + receives screenshot + files it) | 0 min |
-| 7 | Eyeball payment screenshot on dashboard, click "Verify Payment" | ~1 min |
-| 8 | Phone the club to confirm | ~4 min |
-| 9 | Click "Mark Club Notified" → "Mark Completed" | ~10 sec |
-| **Total** | | **~10 min** |
+That's it. The AI handles the rest: parsing intent, asking for missing fields, sending availability updates, sending bank details, ingesting the payment screenshot, sending the final booking confirmation.
 
-**Roughly 60% time reduction per booking** — and the parts that remain are the high-value ones (talking to clubs, verifying payment). The parts that go to zero are the low-value typing work.
+In rough terms, the typing time per booking drops from around twenty to twenty-five minutes to under ten. The parts that stay are the parts that need a human: actual conversations with clubs, the judgement call on a payment screenshot.
 
-## Why "70% reduction" is honestly defensible
+## Why the gain compounds beyond per-booking time
 
-The PRD set 70% as the target. The minute-level breakdown above lands at ~60% per booking. The reason 70% is still the right framing:
+A per-booking time saving isn't the only thing that changes.
 
-1. **Per-booking time isn't the only saving.** Pre-system, an agent loses ~20-30% of their day to *context switching* between conversations. The dashboard collapses all conversations onto one screen with status-driven action buttons; the agent stops scrolling WhatsApp.
+Context-switching collapses. The dashboard puts every active booking on one screen with status-driven action buttons; the operator stops scrolling WhatsApp threads looking for the message they were halfway through.
 
-2. **Messaging volume drops by far more than time.** Of ~30 individual messages exchanged per booking, only 4-5 still involve the human (clicking action buttons that fire AI-composed messages). That's an 80%+ reduction in *messages sent by the human*.
+Off-hours coverage becomes real. A Saturday-evening inquiry doesn't sit in an unread inbox until Monday. The AI collects all the details overnight and presents the operator with a ready-to-act booking at the start of business.
 
-3. **Off-hours coverage.** The AI works at 2am. Pre-system, a Saturday-evening booking inquiry sat in an unread inbox until Monday. Post-system, the AI collects all the details overnight and presents a ready-to-act booking to the operator at start of business.
+Consistency improves. Bank account numbers, cancellation phrasing, time-of-day formatting are identical across bookings. The audit log captures every status change with timestamp and actor, which matters for any business handling payments.
 
-The 70% target is hit by combining per-booking time savings + context-switch elimination + off-hours coverage.
+The throughput-per-operator number ends up somewhere around two and a half to three times higher than pre-system. The exact multiplier depends on how much of the typical operator's day was previously lost to context-switching, which varies.
 
-## Throughput per agent
+## What the system intentionally doesn't automate
 
-If a single agent's working day is 6 productive hours (360 min):
+Equally important to what's automated:
 
-- **Pre-system:** 360 ÷ 25 = **~14 bookings/day max**
-- **Post-system:** 360 ÷ 10 = **~36 bookings/day max**
+- Calling the club. Clubs only take phone calls, and the relationship between the booking agent and the club matters. Voice automation would be wrong here even if it were technically possible.
+- Verifying payment screenshots. A 60-second eyeball check is fast, and the failure mode of misclassification (sending the golfer a "confirmed" message when the payment didn't land) is bad enough that automating it isn't worth the upside.
+- Picking which alternative slots to offer when the first attempt fails. This needs domain judgement about which clubs a particular golfer would actually prefer.
 
-In practice agents won't hit ceiling on either side, but the *headcount-to-volume ratio* changes by roughly 2.5×. That's the number that matters to the founder: each agent can absorb 2.5× the inbound before hiring kicks in.
+The system isn't trying to be the entire job. It's trying to be the part of the job that's data-shuffling.
 
-## Quality wins (harder to put in a table)
+## Operating cost
 
-- **No more "I forgot to reply to that golfer."** Every inbound message gets an immediate AI acknowledgement and a dashboard row. Nothing falls through.
-- **No more inconsistent messaging.** Bank account number, cancellation policy, time-format conventions — all sent by templates, all identical across bookings.
-- **Bilingual at no extra cost.** The AI replies in the language the golfer used. Pre-system this required a bilingual agent on shift.
-- **Audit trail.** Every status change is logged with timestamp + actor (AI or named human). For a payment-handling business, that's not optional.
+The operating cost per booking is small. OpenAI usage is on the order of a few cents per booking with `gpt-4o-mini`. WhatsApp outbound is a few cents in the relevant region. Convex usage at this volume is rounding noise. The dominant operational cost in the business is people-time, which is the cost the system actually attacks.
 
-## What I deliberately did *not* automate
+## Where the bottleneck moves
 
-This is as important as what got automated:
-
-| Activity | Why not | What that means |
-|---|---|---|
-| Calling the club | Clubs only take phone calls; voice automation here would be wrong even if technically possible (relationships matter) | Human still owns club relationships |
-| Verifying payment screenshots | OCR + fraud detection at this scale is not worth the risk of misclassification | Human does the 60-second eyeball check |
-| Picking which alternative slots to offer | Domain judgement (which clubs the golfer would actually prefer) | Human guides this in tricky cases |
-| Handling complaints | Edge cases live here; an LLM response could escalate a refund situation | Operator pauses AI and types directly |
-
-The system is intentionally *not* trying to be the entire job. It's trying to be the 70% of the job that's pure data shuffling.
-
-## Cost vs value (back-of-envelope)
-
-Running cost per booking (rough order of magnitude, mock-to-real):
-
-- OpenAI: ~10-15 LLM calls per booking × `gpt-4o-mini` rates ≈ **$0.02-0.05**
-- WhatsApp Cloud API: free inbound, ~$0.005 per outbound conversation in the relevant region ≈ **$0.03-0.05**
-- Convex: a few hundred function invocations + small storage ≈ **<$0.01**
-- **Total cost per booking: <$0.10**
-
-Value per booking (the agent's time saved at any reasonable Malaysian operations-salary rate): comfortably $1-3.
-
-**Roughly 20-30× ROI on operating cost.** The dominant cost in this business is people-time, not infra. The system attacks the dominant cost.
-
-## How this scales
-
-The shape of the savings doesn't degrade at higher volumes — it gets better, because:
-
-- **Convex scales transparently.** Adding 10× the bookings is "more rows," not "another worker."
-- **LLM cost is per-message, not per-user.** Adding 10× golfers doesn't 100× the cost.
-- **The bottleneck moves to phone calls with clubs.** Which is the *correct* bottleneck for a business that's selling access to physical golf courses.
-
-When phone calls become the bottleneck, the right move is more operators — not more software. The system has shifted the constraint from "can we type fast enough" (a software problem) to "can we make enough phone calls" (a hiring problem). That's a healthier place for the business to be.
+After this system is in place, the limiting factor on booking throughput is no longer typing speed. It's the time it takes to make phone calls to clubs. That's a healthier bottleneck for the business: it shifts the scaling question from "do we have enough software" to "do we have enough phone-call hands". The right response to the second one is hiring, not engineering.

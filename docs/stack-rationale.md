@@ -1,98 +1,56 @@
 # Stack rationale
 
-The PRD asked for FastAPI + Postgres + Celery + Redis + a Next.js dashboard talking to FastAPI over REST. I shipped a different stack. This doc explains why, what it cost, and what it bought.
+A few notes on the technology choices and the trades behind them.
 
-## TL;DR
+## Convex
 
-| Original spec | What I shipped | Net |
-|---|---|---|
-| FastAPI app for business logic | Convex (TypeScript) | -1 deployable, -1 ORM, +reactive queries |
-| Postgres | Convex tables | -1 connection pool to tune |
-| Celery + Redis | Convex scheduled actions / crons | -2 services to host |
-| S3 (or similar) | Convex file storage | -1 SDK, -1 IAM policy to write |
-| FastAPI ingress | FastAPI ingress | Kept — Meta posts to one HTTPS URL that *must* validate HMAC |
-| Next.js → REST → FastAPI | Next.js → Convex live queries | No polling layer, no SWR/react-query |
+Convex is the database, the server-side logic runtime, the job scheduler, the file store, and the live-query layer to the React client. One service, one language, one repo.
 
-## Why Convex (and not Postgres + Celery + Redis)
+The booking workflow is small and heavily state-driven. The interesting properties are:
 
-The original architecture is fine. It's the default for a reason. I picked Convex because the *cost of moving parts* in a small-team product is the dominant cost, and Convex collapses five concerns into one:
+- A handful of tables with well-known access patterns.
+- A lot of mutations that change state and need to fire side effects (send a message, send an email, schedule a follow-up).
+- A dashboard whose entire job is to reflect state and let operators change it.
 
-1. **Schema + queries + mutations + actions** in one runtime, in one language, in one repo.
-2. **Scheduled actions** (`ctx.scheduler.runAfter(...)`) replace Celery. The "send a 24h silence follow-up" cron is ~15 LOC.
-3. **File storage** with signed-URL semantics replaces an S3 setup. Payment-proof image is `await ctx.storage.store(blob)`.
-4. **Live queries to the React client over a websocket** replace the entire "how do I push UI updates" question. No SSE, no polling, no optimistic-state-with-rollback. `useQuery(api.bookings.list)` is the subscription.
-5. **Transactional mutations** — a status transition that writes to `bookings`, appends to `activityLog`, and schedules the AI action either all commits or all rolls back. Zero distributed-transaction gymnastics.
+Convex fits this shape. Mutations are transactional, so a status change that writes to `bookings`, appends to `activityLog`, and schedules an AI action either all commits or all rolls back. Scheduled actions cover the cron use case (24h silence follow-up) without a separate worker. File storage covers payment-proof images without an S3 setup. The React client subscribes to queries over a websocket, so there is no polling layer and no SWR / react-query cache to keep in sync.
 
-### What I gave up
+The trades:
 
-- **Vendor lock-in.** Moving off Convex would mean re-implementing the schema against Postgres and re-implementing actions against a job runner. Real cost, real consideration.
-- **Raw SQL.** Convex's query language is intentionally constrained (indexed equality + range). I would not pick it for a product with heavy ad-hoc analytics. For an operational dashboard with a known query set, the constraint is an asset — every query is fast by construction.
-- **Local-only running.** Convex needs `npx convex dev` to maintain a local sync to its cloud. Tolerable; not love-it.
+- Vendor lock-in. The schema and actions are written against Convex's runtime. Moving to Postgres + a job runner is a real piece of work.
+- Constrained query language. Convex queries are indexed equality and range. For an operational dashboard this is fine; for ad-hoc analytics it would not be.
+- Local development requires a synced Convex dev deployment (`npx convex dev`). Tolerable, not love-it.
 
-### What I would do instead at 10× scale
+For the size and shape of this product, the gain from collapsing five concerns into one runtime is much larger than these trades. At a much larger scale I would probably split the booking tables out behind a domain service, but that is not the problem the system has today.
 
-If this product ever needed to support hundreds of concurrent agents and millions of bookings, I would peel out the booking + conversation tables to Postgres behind a domain service, keep Convex for the operator-side reactivity layer, and let Convex sync from Postgres. I would not preemptively do that today — premature scaling decisions are a tax on iteration speed.
+## FastAPI for the webhook ingress
 
-## Why FastAPI for the webhook ingress (and only there)
+The Meta WhatsApp Cloud API posts to a single HTTPS endpoint, and that endpoint has to verify a raw-body HMAC-SHA256 signature. Two things make Python the path of least resistance here:
 
-Meta WhatsApp Cloud API posts to one HTTPS endpoint. That endpoint *must*:
+- The `hmac.compare_digest` constant-time comparator is the canonical implementation.
+- FastAPI exposes the raw request body in a one-liner before any middleware tries to parse it.
 
-1. Read the **raw** request body (the HMAC is over bytes, not parsed JSON).
-2. Compute `HMAC-SHA256(body, app_secret)` in constant time.
-3. Compare to `X-Hub-Signature-256` and reject on mismatch.
+The ingress runs about 200 lines of code. It validates, normalises the payload to a flat shape, and forwards to a Convex HTTP action. It deliberately does not make business decisions; that all lives in Convex.
 
-I picked FastAPI because:
+I considered handling validation inside a Convex HTTP action directly. Two reasons I didn't: reaching the raw body from inside Convex's HTTP action is more fiddly than from FastAPI, and isolating the public-facing endpoint on its own deployable means a bug elsewhere in the system can't reach the validator.
 
-- Python's `hmac.compare_digest` is the canonical constant-time comparator and the surrounding ecosystem (`fastapi.Request.body()`) makes "read raw bytes before any middleware parses them" a one-liner.
-- The ingress has no business logic. It validates, normalises to a flat JSON shape, and forwards to Convex. ~200 LOC, easy to read top-to-bottom, easy to audit.
-- It is the only public-internet endpoint that accepts data from an unauthenticated source. Isolating it on its own deployable shrinks the *trusted surface* — a CVE in some unrelated Convex function can't reach the HMAC validator.
+## Next.js + Convex React client
 
-I considered putting the HMAC check in a Convex HTTP action directly. Two reasons I didn't:
+The dashboard's only job is to keep three views in sync with state that both humans and the AI are mutating: the bookings list, the per-booking detail panel, and the conversation thread.
 
-- Convex HTTP actions receive a parsed body; reaching back for the raw bytes works but is fiddly and version-dependent.
-- The hostname matters. Meta's webhook setup wants a single stable URL; keeping it on a dedicated ingress means I can swap Convex deploys without rotating the URL with Meta.
+The typical REST-style implementation needs polling, an SSE/WebSocket layer, or optimistic updates with rollback. All three carry a non-trivial amount of code and a bug class each.
 
-## Why Next.js + Convex React client (and not REST)
+`useQuery(api.bookings.list)` registers a subscription. When a mutation modifies a row the query touches, the client receives a fresh snapshot. There is no `useEffect`, no `setInterval`, no `swr`, no `react-query`. The query is the subscription.
 
-The dashboard's whole job is to keep three views in sync with state that's being changed by *both* humans and the AI: the bookings list, the per-booking detail panel, and the conversation thread.
+## OpenAI with structured outputs
 
-The REST-style implementation requires:
-- A polling cadence ("refetch every 5s") or
-- An SSE/WebSocket layer ("when a booking changes, push the new row") or
-- Optimistic state with rollback logic
+`gpt-4o-mini` with the JSON schema response format. One call per inbound message returns the reply text, the booking fields the model extracted, and an intent classification.
 
-All three are a non-trivial amount of code, and each has its own bug class.
+Structured outputs are reliable. The OpenAI API enforces the schema at decode time, so the response either parses or the call fails. There is no "the model wrapped my JSON in prose" failure mode to handle.
 
-Convex's React client gives this for free. `useQuery(api.bookings.list)` registers a subscription. When a mutation modifies a row the query touches, the client gets a new snapshot. There's no `useEffect`, no `setInterval`, no `swr`, no `react-query`. The query *is* the subscription.
+A pipeline of separate calls for routing, extraction, and reply generation would mean shipping the conversation history into each step and keeping three prompts in sync. One call sharing one context is simpler and cheaper. Details in [ai-agent-design.md](ai-agent-design.md).
 
-This is the single biggest reason the dashboard code is small.
+## Mock-first integrations
 
-## Why OpenAI (with structured output) for the AI
+Every external client (`lib/openai.ts`, `lib/whatsapp.ts`, `lib/email.ts`, `lib/convex_client.py`) exports the same interface in both `mock` and `real` mode. An environment variable picks which one runs at startup. Mock mode logs the payload to stdout and returns a canned response.
 
-I chose `gpt-4o-mini` with the structured-output `response_format` API. Three reasons:
-
-1. **One call, multiple jobs.** Reply text + extracted booking fields + intent classification share the same context window. A router-then-extractor-then-replier pipeline is more total tokens *and* introduces sync issues between the steps.
-2. **JSON mode is reliable.** Structured outputs guarantee the response parses against a schema. No "the model returned `Sure, here is your JSON: {…}`" failure mode.
-3. **Cost & latency for this domain.** Booking intake is closed-vocabulary (clubs, dates, players). The cheap model is enough.
-
-See [ai-agent-design.md](ai-agent-design.md) for the full prompt design and intent-routing logic.
-
-## Why mock-first integrations
-
-Every external client (`lib/openai.ts`, `lib/whatsapp.ts`, `lib/email.ts`) exports the same interface in both modes. An env var (`OPENAI_MODE`, `WHATSAPP_MODE`, `EMAIL_MODE`) picks `mock` or `real` at runtime. In mock mode the function logs the payload to stdout and returns a canned response.
-
-This bought three things:
-
-- **End-to-end demos with zero accounts.** Pull the repo, `npm install`, `npx convex dev`, browse to the dashboard, and the system runs. Critical for showing the system to non-technical stakeholders without burning live WhatsApp message quota.
-- **Deterministic tests.** Unit and smoke tests run against the mocks; no flaky external dependencies.
-- **One-line cutover to prod.** Set `*_MODE=real`, ship.
-
-## What I'd add if this were going to production for real
-
-These are out of scope for the portfolio build but worth naming:
-
-- **Tracing.** OpenTelemetry from FastAPI → Convex actions, with the WhatsApp `wamid` as the correlation ID. Right now I lean on Convex's per-action logs and structured `console.log` lines; that's fine until it isn't.
-- **Idempotency keys** on the inbound webhook. Meta retries on 5xx; we already dedupe by `providerMessageId`, but I'd make this explicit at the HTTP layer.
-- **Rate limiting per golfer.** A single golfer firing 20 messages in 5 seconds shouldn't fan out to 20 OpenAI calls. Easy with a Convex mutation that checks a sliding window.
-- **Human override hand-off.** Right now the AI is always on. A toggle on the booking detail page that pauses AI replies and lets the operator type directly — useful for the 1% of conversations that need bespoke handling.
-- **Audit log export.** `activityLog` is in Convex; a daily dump to cold storage (S3 / GCS) would be table stakes for any deployment with compliance obligations.
+This buys three things. The whole system runs end-to-end with no external accounts, which is useful for demos and local development. Tests can run against the mocks deterministically. Switching to production is changing a single env var per service.

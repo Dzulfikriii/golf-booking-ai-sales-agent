@@ -1,8 +1,8 @@
 # Architecture
 
-A guided tour of the system. Three deployables, one database, one source of truth for state — the booking status.
+Three services, one database. The booking status is the source of truth for every other piece of behaviour in the system.
 
-## The three services
+## Services
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -10,53 +10,46 @@ A guided tour of the system. Three deployables, one database, one source of trut
 │   WhatsApp                                                              │
 │  (Meta Cloud API)                                                       │
 │        │                                                                │
-│        │ 1. inbound msg / status callback                               │
+│        │  inbound msg / status callback                                 │
 │        ▼                                                                │
 │  ┌─────────────────────┐                                                │
-│  │ FastAPI ingress     │ — verify HMAC, normalise payload, fan out      │
+│  │ FastAPI ingress     │  verify HMAC, normalise payload, forward       │
 │  │  /webhook/whatsapp  │                                                │
 │  └──────────┬──────────┘                                                │
-│             │ 2. POST /ingress/whatsapp (Convex HTTP action)            │
+│             │  POST /ingress/whatsapp (Convex HTTP action)              │
 │             ▼                                                           │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Convex (the system of record)                                   │   │
-│  │                                                                  │   │
-│  │  • schema (bookings, golfers, clubs, conversations, …)           │   │
-│  │  • mutations  (transactional state writes)                       │   │
-│  │  • internal actions (LLM calls, WhatsApp send, email send)       │   │
-│  │  • cron (24h silence follow-up)                                  │   │
-│  │  • storage (payment-proof images)                                │   │
+│  │  Convex                                                          │   │
+│  │   schema, mutations, internal actions, crons, file storage       │   │
 │  └──────────────────────────────┬───────────────────────────────────┘   │
-│                                 │ 3. live-query push                    │
+│                                 │  live-query push                      │
 │                                 ▼                                       │
 │                       ┌───────────────────────┐                         │
 │                       │  Next.js dashboard    │                         │
-│                       │  (Convex React client)│                         │
 │                       └───────────────────────┘                         │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Why three, not one?**
-- The webhook ingress is Python because HMAC-SHA256 validation needs the raw request body, and isolating it shrinks the trusted surface for a public-internet endpoint to ~200 LOC.
-- Convex is the only place state lives. No shadow tables, no caches that need invalidating.
-- The dashboard never talks to FastAPI. It subscribes to Convex queries and renders. State the AI changes shows up on the operator's screen without a refresh.
+The webhook ingress is Python because HMAC-SHA256 verification has to happen against the raw request body, and keeping that on its own service shrinks the public-internet attack surface to a couple of hundred lines of code. The ingress does no business logic; it validates, normalises to a flat shape, and forwards.
 
-## Booking status state machine
+Convex holds all state. The dashboard never talks to the FastAPI service; it subscribes to Convex queries directly. When the AI mutates a row, the operator's UI updates without a refresh. When the operator flips a status, the AI sees it through the same query layer.
 
-Twelve statuses. Every transition is either golfer-driven (via the AI) or human-driven (via the dashboard). The status drives both the UI (which buttons render) and the AI (what message to send next when status changes).
+## Booking status machine
+
+Twelve statuses. Every transition is either golfer-driven (through the AI) or operator-driven (through the dashboard). The status drives the dashboard (which action buttons render) and the AI (what message to send when the status changes).
 
 ```
                      ┌─────────┐
    golfer message ──▶│ pending │
                      └────┬────┘
-                          │  agent: "Mark Checking Availability"
+                          │  operator: Mark Checking Availability
                           ▼
               ┌───────────────────────┐
               │ checking_availability │
               └────────┬──────────────┘
-        agent: Slot   │     agent: Slot
-        Available     │     Unavailable
+        operator:     │     operator:
+        Slot Available│     Slot Unavailable
                 ▼     │     ▼
    ┌────────────────┐ │ ┌────────────────────┐
    │ slot_available │ │ │ slot_unavailable   │
@@ -66,64 +59,65 @@ Twelve statuses. Every transition is either golfer-driven (via the AI) or human-
 │ awaiting_golfer_         │  → new pending booking
 │ confirmation             │
 └────────┬─────────────────┘
-   golfer replies "yes"  (AI detects intent)
+   golfer replies yes (AI detects intent)
          ▼
   ┌──────────────────┐
   │ golfer_confirmed │
   └────────┬─────────┘
            ▼
   ┌──────────────────┐
-  │ awaiting_payment │  ← AI auto-sends bank details + payment instructions email
+  │ awaiting_payment │   ← AI sends bank details + payment-instructions email
   └────────┬─────────┘
-   golfer sends image  (AI stores it, transitions status)
+   golfer sends image (AI stores it, transitions status)
          ▼
   ┌──────────────────┐
   │ payment_received │
   └────────┬─────────┘
-   agent: "Verify Payment"
+   operator: Verify Payment
          ▼
   ┌──────────────────┐
   │ payment_verified │
   └────────┬─────────┘
-   agent: "Mark Club Notified"
+   operator: Mark Club Notified
          ▼
   ┌──────────────────┐
   │ club_notified    │
   └────────┬─────────┘
-   agent: "Mark Completed"
+   operator: Mark Completed
          ▼
   ┌──────────────────┐
-  │ completed        │  ← AI sends final confirmation + booking confirmation email
-  └──────────────────┘                                       + club notification email
+  │ completed        │   ← AI sends final confirmation
+  └──────────────────┘     + booking confirmation email + club notification email
 
-Any state ──▶ cancelled  (Cancel Booking button, always available)
+Any state ──▶ cancelled (Cancel Booking button, always available)
 ```
 
-Each status has exactly one set of legal next statuses. The mutation `bookings.transitionStatus` validates the transition, writes the new status atomically, appends to `activityLog`, and schedules two side-effect actions:
-- `ai.handleStatusTransition` — composes and sends the WhatsApp message for the new status.
-- `statusTransitions.sendEmailsForStatus` — picks the right email template for the new status (or no-op).
-
-**Two paths to the same status.** `awaiting_payment` is reached either by the human flipping it manually or by the AI promoting the booking when the golfer says "yes". Both paths fund the same action — there's no second copy of the side-effect logic.
+Each transition runs through one mutation, `bookings.transitionStatus`. That mutation validates the move is legal, writes the new status, appends to `activityLog`, and schedules two side-effect actions: one to send the outbound WhatsApp message, one to send the right email (if any). Both branches share the same path whether the transition came from the AI or the operator, so there is no second copy of the side-effect logic.
 
 ## Webhook contract
 
-Meta WhatsApp Cloud API hits the FastAPI ingress in two shapes:
+The Meta WhatsApp Cloud API hits the FastAPI ingress in two shapes.
 
 ### Verification (GET)
+
 ```
 GET /webhook/whatsapp?hub.mode=subscribe
                      &hub.verify_token=…
                      &hub.challenge=…
 ```
-We compare `hub.verify_token` to the configured value and echo `hub.challenge` on match.
+
+The verify token is compared to a configured value; on match we echo back `hub.challenge`.
 
 ### Delivery (POST)
-Every inbound message and every outbound status callback. We:
 
-1. Read the raw bytes (NOT the parsed JSON — the signature is over the raw body).
-2. Compute `HMAC-SHA256(raw_body, META_APP_SECRET)` and compare to `X-Hub-Signature-256` in constant time.
-3. Reject on mismatch with a 401.
-4. Parse and normalise to a single shape:
+For every inbound message and every outbound status callback. The handler:
+
+1. Reads the raw bytes of the request body (not the parsed JSON; the signature is computed over bytes).
+2. Computes `HMAC-SHA256(body, META_APP_SECRET)` and compares to `X-Hub-Signature-256` in constant time.
+3. Returns 401 on mismatch.
+4. Parses, normalises to a flat shape, forwards to a Convex HTTP action.
+
+The normalised payload:
 
 ```json
 {
@@ -135,11 +129,9 @@ Every inbound message and every outbound status callback. We:
 }
 ```
 
-5. POST it to a Convex HTTP action `/ingress/whatsapp`, which schedules the internal action `ai:handleIncomingMessage`. Convex resolves any image `mediaId` into bytes via the Meta Graph API and stores it in Convex file storage.
+On the Convex side, `ai.handleIncomingMessage` is scheduled. Image messages are resolved through the Meta Graph API into bytes and stored in Convex file storage; the original media URL from Meta expires after 24 hours, so re-storing immediately is the only safe move.
 
-The ingress doesn't make business decisions. It validates, normalises, hands off.
-
-## Inbound message flow (golfer → AI)
+## Inbound flow (golfer → AI)
 
 ```
 WhatsApp inbound POST
@@ -148,38 +140,36 @@ WhatsApp inbound POST
 Convex http action /ingress/whatsapp
        │
        ▼  schedules
-ai.handleIncomingMessage (internal action)
+ai.handleIncomingMessage
        │
        ├─ upsert golfer by WhatsApp number
-       ├─ ensure conversation exists, append user message
+       ├─ ensure conversation, append the user message
        │
        ├─ if image + booking is awaiting_payment:
        │     download media → file storage → transition to payment_received
        │     reply "got it, we'll confirm shortly"
        │     return
        │
-       ├─ ONE OpenAI call returns { reply, collected, intent }
+       ├─ one OpenAI call returns { reply, collected, intent }
        │
-       ├─ intent = confirming_yes & booking is awaiting confirmation:
-       │     chain transitions: slot_available → awaiting_golfer_confirmation
-       │                        → golfer_confirmed → awaiting_payment
-       │     (each transition fires its own side effects via the same mutation)
-       │     return  ← AI doesn't reply directly; the awaiting_payment transition
-       │              auto-sends bank details
+       ├─ intent confirming_yes & awaiting confirmation:
+       │     transition booking through to awaiting_payment
+       │     (bank details auto-sent by status-triggered path)
+       │     return
        │
-       ├─ intent = confirming_no & awaiting confirmation:
+       ├─ intent confirming_no & awaiting confirmation:
        │     transition booking → cancelled, send reply
        │
        ├─ all four fields collected & no active booking:
-       │     create booking (status=pending), link to conversation, send ack
+       │     create pending booking, link to conversation, send reply
        │
        └─ default:
              update conversation stage + collected fields, send reply
 ```
 
-The clever bit: the AI **never sends a hardcoded "what date would you like" message**. It generates the reply contextually from history + what's been collected so far + what's missing. The state machine only nudges which question is most appropriate to ask next.
+The reply text is generated, never templated, on this path. The model sees the conversation history, the partial booking data collected so far, and the current stage, and writes whatever makes sense next.
 
-## Outbound flow (dashboard human → golfer)
+## Outbound flow (operator → golfer)
 
 ```
 Operator clicks "Slot Available"
@@ -188,55 +178,37 @@ Operator clicks "Slot Available"
 bookings.transitionStatus({ id, toStatus: "slot_available" })
        │
        ├─ validate legal transition
-       ├─ write status + updatedAt
-       ├─ append activityLog entry
+       ├─ write status, append activityLog
        │
        ├─ schedule ai.handleStatusTransition
-       │     │
-       │     ▼ composes: "Good news! {club} has a slot on {date} at {time}…"
-       │       sendMessage via WhatsApp Cloud API
-       │       append assistant message to conversation
-       │       update conversation stage to awaiting_confirmation
+       │     composes "Good news! {club} has a slot on {date}…"
+       │     sendMessage via WhatsApp Cloud API
+       │     append assistant message to conversation
        │
        └─ schedule statusTransitions.sendEmailsForStatus
-             │
-             ▼ picks slotAvailableEmail template
-               sendEmail to golfer
+             pick the right template (slot available, completed, cancelled, …)
+             sendEmail
 ```
 
-The dashboard renders the new status the instant the mutation lands — same Convex query that the human just wrote to. No "refresh to see changes". The conversation panel updates as the AI appends its reply.
+Outbound messages on the status-triggered path are templated, not LLM-generated. They carry transactional data (bank account numbers, dates, player counts) where exactness matters more than tone variety.
 
-## Reactive dashboard (no polling, no useEffect)
+## Reactive dashboard
 
-Every page is a thin shell around `useQuery(api.bookings.list)` or similar. Convex pushes new data over a websocket whenever a mutation touches a row the query depends on.
+Every page in the dashboard wraps a `useQuery(api.bookings.list)` (or similar). Convex pushes new snapshots over a websocket whenever a mutation touches a row the query depends on.
 
-Concretely: when the AI's `handleIncomingMessage` appends a message to the conversation, the operator's `BookingDetail` page re-renders with the new message — without polling, without manual cache invalidation, without optimistic updates that need rollback logic. The query *is* the subscription.
+When the AI appends an assistant message to a conversation, the operator's open `BookingDetail` page renders the new message immediately. No polling, no optimistic updates, no manual cache invalidation. The query is the subscription.
 
-This is the single biggest reason the codebase is small. There is no React state for "current booking list" that has to be kept in sync with the server.
+This is the largest single reason the dashboard code is small.
 
 ## File storage
 
-Payment-proof images are downloaded from Meta's media endpoint (24-hour signed URL) and re-stored in Convex file storage immediately on receipt. Two reasons:
-1. The Meta URL expires; the booking record needs to point at something durable.
-2. We only ever expose the proof to authenticated dashboard users via a Convex storage URL — no static path is leaked.
+Payment-proof images move through three places. The image arrives at the FastAPI ingress as a `mediaId` reference. Convex fetches the bytes from Meta's media endpoint using the access token, then writes the blob to Convex file storage and saves the `_storage` ID on the booking. The dashboard renders the image via a Convex storage URL, which is short-lived and scoped.
 
 ## Failure surfaces
 
 | Failure | Behaviour |
 |---|---|
 | Webhook HMAC mismatch | 401, no DB write, no AI call. Logged with a signature-prefix excerpt. |
-| OpenAI 5xx / timeout | Action retries via Convex's built-in action retry. User-facing message is delayed, never duplicated (idempotent on conversation `providerMessageId`). |
-| WhatsApp send fails | Conversation message is appended *after* successful send; on failure we don't poison the conversation log. Status transition still committed (the operator can re-trigger the send). |
-| Golfer goes silent 24h | Cron `crons.ts` sweeps bookings in `awaiting_payment` / `awaiting_golfer_confirmation` with `lastSilencePingAt < now − 24h` and sends one polite follow-up. Marked so we don't ping twice. |
-| Convex action transient error | Built-in retry with exponential backoff. The inbound message was persisted before any external call, so retries are safe. |
-
-## Why this shape, not the PRD's shape
-
-The PRD asked for FastAPI + Postgres + Celery + Redis + a Next.js dashboard that calls FastAPI over REST. I shipped Convex + a thin FastAPI ingress + a Convex-native dashboard.
-
-The trade I made:
-
-- **Lost:** vendor portability. The entire backend is on Convex; moving would mean rewriting the schema and actions against another runtime.
-- **Gained:** ~half the moving parts, native reactivity (no SSE / polling layer to build), built-in scheduled actions (no Celery worker to host), built-in file storage (no S3 wiring), and a single deployment surface.
-
-For a system this size, run by a small team, the gain is wildly larger than the loss. See [stack-rationale.md](stack-rationale.md) for the full argument.
+| OpenAI 5xx / timeout | Action retries via Convex's built-in retry. The inbound user message was persisted before the LLM call, so retries are safe. |
+| WhatsApp send fails | The assistant message is only appended to the conversation after a successful send, so the conversation log doesn't get poisoned with messages that never went out. |
+| Golfer goes silent 24h | A cron sweeps `awaiting_payment` and `awaiting_golfer_confirmation` bookings older than 24h since the last ping and sends a single follow-up. `lastSilencePingAt` prevents double-pinging. |
